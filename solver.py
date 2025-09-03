@@ -182,7 +182,7 @@ def build_first_prompt(task_without_test_output: Dict[str, Any], version: str) -
     # default: real_world
     return (
         "The image shows examples of input (top) output (bottom) pairs for 3 train examples. "
-        "Predict the output for the fourth test example.\n\n"
+        "Do not just predict the output for the fourth test example. Give a high-level explanation instead of how to map input situations into output.\n\n"
         "Think about the images as encoding a real world situation in an abstract way. "
         "The top is at some time and bottom is after some time.\n\n"
         "Think about a simple story or explanation for these. Remember it has to deterministically allow to predict output from input image\n\n"
