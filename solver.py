@@ -172,6 +172,24 @@ def build_codegen_prompt(initial_reasoning: str, task: Dict[str, Any]) -> str:
         "Implement predict_output so that it reproduces all training outputs when applied to the training inputs."
     )
 
+def build_first_prompt(task_without_test_output: Dict[str, Any], version: str) -> str:
+    if version == "trivial":
+        return (
+            "You are given ARC training input/output pairs and a test input. "
+            "Predict the output for the test input. Be deterministic; infer a rule mapping input to output.\n\n"
+            f"Task (JSON without test outputs): {json.dumps(task_without_test_output)}"
+        )
+    # default: real_world
+    return (
+        "The image shows examples of input (top) output (bottom) pairs for 3 train examples. "
+        "Predict the output for the fourth test example.\n\n"
+        "Think about the images as encoding a real world situation in an abstract way. "
+        "The top is at some time and bottom is after some time.\n\n"
+        "Think about a simple story or explanation for these. Remember it has to deterministically allow to predict output from input image\n\n"
+        f"Here is also representation of the task as simple JSON: {json.dumps(task_without_test_output)}\n"
+        "Remember to think about it as abstract depiction of a real world situation."
+    )
+
 def execute_and_validate_generated_code(code_str: str, task: Dict[str, Any]) -> Tuple[bool, str | None, List[List[List[int]]] | None]:
     namespace: Dict[str, Any] = {}
     try:
@@ -222,34 +240,28 @@ def extract_text(response_json):
                 out.append(c.get("text", ""))
     return "\n".join(out).strip()
 
-def main(ntries: int = 3):
+def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', ntries: int = 3, prompt_version: str = 'real_world'):
     # Load task from JSON file
-    task_file = '../ARC-AGI/data/training/007bbfb7.json'
-    # d5d6de2d - simple one
-    # d631b094 - just count
     task = load_task(task_file)
     task_without_test_output = task.copy()
-    del task_without_test_output['test']['output'] 
+    for ex in task_without_test_output['test']:
+        del ex['output']
     
-    console.log("Starting ARC solve pipeline")
+    console.log(f"Starting ARC solve pipeline (task_file={task_file}, ntries={ntries}, prompt_version={prompt_version})")
+    task_id = os.path.splitext(os.path.basename(task_file))[0]
     # Visualize inputs (without test outputs) for context only
     plot_task(task, show_test_output=False)
-    plt.savefig("task.png")
+    task_image_path = f"{task_id}.task.png"
+    plt.savefig(task_image_path)
     plt.close()
-    console.log("Saved task visualization → task.png")
+    console.log(f"Saved task visualization → {task_image_path}")
 
     # First LLM call (vision + text) to get reasoning/description
-    prompt1 = (
-        "The image shows examples of input (top) output (bottom) pairs for 3 train examples. "
-        "Predict the output for the fourth test example.\n\n"
-        "Think about the images as encoding a real world situation in an abstract way. "
-        "The top is at some time and bottom is after some time.\n\n"
-        "Think about a simple story or explanation for these. Remember it has to deterministically allow to predict output from input image\n\n"
-        f"Here is also representation of the task as simple JSON: {json.dumps(task_without_test_output)}\n"
-        "Remember to think about it as abstract depiction of a real world situation."
-    )
-    first_text, first_raw = submit_to_openai_api('task.png', prompt1)
+    prompt1 = build_first_prompt(task_without_test_output, prompt_version)
+    first_text, first_raw = submit_to_openai_api(task_image_path, prompt1)
     console.log(f"First call (vision+text) produced description_len={len(first_text)}")
+    console.log("First call output_text:")
+    console.log(first_text)
 
     # Second LLM call: code generation based on first_text and task
     code_attempts: List[Dict[str, Any]] = []
@@ -286,9 +298,10 @@ def main(ntries: int = 3):
             if i < len(viz_task.get("test", [])):
                 viz_task["test"][i]["output"] = pred
     plot_task(viz_task, show_test_output=True)
-    plt.savefig("output.png")
+    predicted_image_path = f"{task_id}.output.png"
+    plt.savefig(predicted_image_path)
     plt.close()
-    console.log("Saved predicted visualization → output.png")
+    console.log(f"Saved predicted visualization → {predicted_image_path}")
 
     # Save detailed JSON
     out_json = {
@@ -302,9 +315,13 @@ def main(ntries: int = 3):
         "ntries": ntries,
         "success": success,
     }
-    with open("output.json", "w") as f:
+    out_json["task_file"] = task_file
+    out_json["task_id"] = task_id
+    out_json_path = f"{task_id}.output.json"
+    with open(out_json_path, "w") as f:
         json.dump(out_json, f, indent=2)
-    console.log("Saved outputs → output.json")
+    console.log(f"Saved outputs → {out_json_path}")
 
 if __name__ == "__main__":
-    main()
+    import fire
+    fire.Fire(main)

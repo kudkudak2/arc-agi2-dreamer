@@ -1,0 +1,3 @@
+../ARC-AGI/data/training/007bbfb7.json # the inset task
+../ARC-AGI/data/training/d5d6de2d # pretty simple fill in 
+../ARC-AGI/data/training/d631b094 # just count
