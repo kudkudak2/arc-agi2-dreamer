@@ -122,17 +122,24 @@ def solve_puzzle(task_file: str, prompt_version: str, ntries: int = 3) -> Dict:
         raise
 
 def create_results_table(results: List[Dict], dataset: str) -> Table:
-    """Create a rich table showing evaluation results."""
+    """Create a rich table showing evaluation results.
+    
+    Symbols used:
+    - OK = Task solved successfully
+    - FAIL = Task attempted but failed
+    - ? = Task not yet attempted
+    """
     table = Table(title=f"ARC Solver Evaluation - {dataset.upper()}")
     table.add_column("Puzzle", style="cyan", no_wrap=True)
-    table.add_column("Trivial", justify="center", style="green")
-    table.add_column("Real World", justify="center", style="blue")
-    table.add_column("Both Correct", justify="center", style="bold green")
+    table.add_column("Trivial", justify="center", style="green", header_style="bold")
+    table.add_column("Real World", justify="center", style="blue", header_style="bold")
+    table.add_column("Both Correct", justify="center", style="bold green", header_style="bold")
+    table.add_column("Completed", style="yellow", no_wrap=True)
     
     trivial_correct = 0
     real_world_correct = 0
     both_correct = 0
-    total_puzzles = len(results) // 2  # Each puzzle has 2 results (trivial + real_world)
+    completed_puzzles = []
     
     # Group results by puzzle
     puzzle_results = {}
@@ -145,6 +152,9 @@ def create_results_table(results: List[Dict], dataset: str) -> Table:
             puzzle_results[puzzle_id] = {}
         puzzle_results[puzzle_id][prompt_version] = result
     
+    # Calculate total puzzles from the grouped results
+    total_puzzles = len(puzzle_results)
+    
     # Add rows to table
     for puzzle_id, versions in puzzle_results.items():
         trivial_result = versions.get("trivial", {})
@@ -154,6 +164,11 @@ def create_results_table(results: List[Dict], dataset: str) -> Table:
         real_world_correct_flag = real_world_result.get("correct", False)
         both_correct_flag = trivial_correct_flag and real_world_correct_flag
         
+        # Check if puzzle is completed (both versions attempted)
+        is_completed = len(versions) == 2
+        if is_completed and puzzle_id not in completed_puzzles:
+            completed_puzzles.append(puzzle_id)
+        
         if trivial_correct_flag:
             trivial_correct += 1
         if real_world_correct_flag:
@@ -161,20 +176,41 @@ def create_results_table(results: List[Dict], dataset: str) -> Table:
         if both_correct_flag:
             both_correct += 1
         
+        # Show "OK" for correct, "FAIL" for attempted but failed, "?" for not attempted
+        trivial_display = "OK" if trivial_correct_flag else ("?" if "trivial" not in versions else "FAIL")
+        real_world_display = "OK" if real_world_correct_flag else ("?" if "real_world" not in versions else "FAIL")
+        both_display = "OK" if both_correct_flag else ("?" if len(versions) < 2 else "FAIL")
+        
+        # Create completed puzzles list for this row
+        completed_list = ", ".join(completed_puzzles) if completed_puzzles else "None"
+        
         table.add_row(
             puzzle_id,
-            "✓" if trivial_correct_flag else "✗",
-            "✓" if real_world_correct_flag else "✗",
-            "✓" if both_correct_flag else "✗"
+            trivial_display,
+            real_world_display,
+            both_display,
+            completed_list
         )
+    
+    # Add legend row
+    table.add_section()
+    table.add_row(
+        "[bold]LEGEND[/bold]",
+        "[green]OK = Solved[/green]",
+        "[red]FAIL = Failed[/red]", 
+        "[yellow]? = Not Attempted[/yellow]",
+        ""
+    )
     
     # Add summary row
     table.add_section()
+    completed_list = ", ".join(completed_puzzles) if completed_puzzles else "None"
     table.add_row(
         "[bold]SUMMARY[/bold]",
         f"{trivial_correct}/{total_puzzles}",
         f"{real_world_correct}/{total_puzzles}",
-        f"{both_correct}/{total_puzzles}"
+        f"{both_correct}/{total_puzzles}",
+        completed_list
     )
     
     return table
