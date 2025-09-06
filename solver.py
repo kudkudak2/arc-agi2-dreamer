@@ -47,7 +47,7 @@ def _compute_prompt_cache_key_image(image_path: str, prompt: str, model: str | N
     model_id = model or "gpt-5-2025-08-07"
     return f"openai:{model_id}:image={image_path}:prompt={prompt}"
 
-def submit_to_openai_api(image_path: str, prompt: str, api_key: str = None, model: str = None):
+def submit_to_openai_api(image_path: str, prompt: str, api_key: str = None, model: str = None, recalculate_cache=False):
     api_key = api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("Set OPENAI_API_KEY or pass api_key.")
@@ -56,7 +56,7 @@ def submit_to_openai_api(image_path: str, prompt: str, api_key: str = None, mode
     model = model or "gpt-5-2025-08-07"
 
     cache_key = _compute_prompt_cache_key_image(image_path, prompt, model)
-    if cache_key in CACHE:
+    if cache_key in CACHE and not recalculate_cache:
         console.log(f"[dim]Cache hit (image+text): model={model}, image={image_path}[/dim]")
         return CACHE[cache_key]
 
@@ -83,7 +83,7 @@ def submit_to_openai_api(image_path: str, prompt: str, api_key: str = None, mode
         # Optional but supported in GPT-5 examples:
         "text": {"verbosity": "low"},
         # You can omit this; included here to bound the answer size
-        "max_output_tokens": 10000,
+        "max_output_tokens": 100000, # 10k can be too short sometimes, 100k is a lot 
     }
 
     # Set timeout to 15 minutes (900 seconds) to avoid ReadTimeoutError
@@ -93,7 +93,7 @@ def submit_to_openai_api(image_path: str, prompt: str, api_key: str = None, mode
         "https://api.openai.com/v1/responses",
         headers=headers,
         json=payload,
-        timeout=900  # 15 minutes
+        timeout=1800  # 30 minutes
     )
     # Show API error details verbatim on failure (helps pinpoint 400 root cause)
     if not resp.ok:
@@ -135,7 +135,7 @@ def submit_openai_text(prompt: str, api_key: str = None, model: str = None):
         ],
         "reasoning": {"effort": "high"},
         "text": {"verbosity": "low"},
-        "max_output_tokens": 10000,
+        "max_output_tokens": 100000, # its a lot actually.
     }
 
     start_ts = time.time()
@@ -162,7 +162,6 @@ def build_codegen_prompt(initial_reasoning: str, task: Dict[str, Any]) -> str:
     return (
         "You are given an ARC task. Based on the reasoning below, write Python 3 code that implements the transformation from input grid to output grid.\n"
         "Constraints:\n"
-        "- Do not use external libraries (no numpy); use pure Python lists.\n"
         "- Provide a function named predict_output(input_grid) -> list[list[int]].\n"
         "- Do not read files or network; be deterministic.\n"
         "- Only output valid Python code, no markdown fences, no explanation.\n\n"
@@ -179,6 +178,33 @@ def build_first_prompt(task_without_test_output: Dict[str, Any], version: str) -
             "Predict the output for the test input. Be deterministic; infer a rule mapping input to output.\n\n"
             f"Task (JSON without test outputs): {json.dumps(task_without_test_output)}"
         )
+
+    if version == 'real_world_v2':
+        return (
+"""
+Your goal is to build a story (a scene with objects and how they will change in time) that explains all changes in the training input/output images and apply it to the test inputs.
+
+Your job: from training input/output images, infer a single simple world-story that explains all changes, then apply that same story to the test inputs. 
+
+How to think (human style): 
+
+1. See a scene with a story, not pixels. Name the setting (sky, water, floor, canvas), the objects (clouds, islands, ladders, bricks, stains, windows), and their roles (background, actor, marker, wall, paint). Something will happen soon!
+2. Collect invariants & cues. Colors-as-roles (background vs ink/marker), borders as walls/frames, gravity = vertical, contact = sticking/painting, symmetry, repetition, counting, enclosure, ordering. 
+3. Tell the story that fits every train pair. Examples: clouds drift right until a wall; paint spreads through connected water; the tallest stack wins and repaints the row it touches; each window shows a rotated copy of its symbol. 
+4. State the law crisply. Turn the story into one clear rule with triggers and outcomes: “If an actor touches a marker, recolor the actor with the marker’s color; otherwise leave it.” Prefer one sentence; allow short tie-breakers (e.g., choose largest, leftmost, first in reading order).
+5. Mentally simulate. Apply the law to each test input step by step (move, paint, merge, mirror, count…). 
+6. Keep the same story; do not invent new rules for tests. 
+7. Self-check. Verify the story explains all train pairs exactly; if not, revise. It might be you are missing some contextualization
+
+Key things about rules: 
+A) rules are often contextual
+B) rules are often compositional
+C) symbols will have often semantic meaning. 
+
+Note that A-C is just like in the real world where what happens next depends on the context! 
+"""
+        )
+
     # default: real_world
     return (
         "The image shows examples of input (top) output (bottom) pairs for 3 train examples. "
@@ -223,7 +249,8 @@ def execute_and_validate_generated_code(code_str: str, task: Dict[str, Any]) -> 
 
 def refine_code_prompt(previous_prompt: str, code_str: str, error_text: str, task: Dict[str, Any]) -> str:
     return (
-        "Your previous code did not pass. Fix it.\n"
+        "Your previous attempt did not pass. Fix it.\n"
+        "It might have not passed due to the story being incorrect e.g. too general. Please consider revising the story! \n"
         "Only output valid Python code (no fences, no commentary).\n\n"
         f"Previous prompt:\n{previous_prompt}\n\n"
         f"Previous code:\n{code_str}\n\n"
@@ -240,7 +267,7 @@ def extract_text(response_json):
                 out.append(c.get("text", ""))
     return "\n".join(out).strip()
 
-def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', ntries: int = 3, prompt_version: str = 'real_world'):
+def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', recalculate_cache=False, ntries: int = 3, prompt_version: str = 'real_world'):
     # Load task from JSON file
     task = load_task(task_file)
     task_without_test_output = task.copy()
@@ -249,16 +276,18 @@ def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', ntries: int 
     
     console.log(f"Starting ARC solve pipeline (task_file={task_file}, ntries={ntries}, prompt_version={prompt_version})")
     task_id = os.path.splitext(os.path.basename(task_file))[0]
+    prompt_tag = 'real' if prompt_version in ('real_world', 'real') else 'trivial'
+    prompt_tag = "real_v2" if prompt_version == "real_world_v2" else prompt_tag
     # Visualize inputs (without test outputs) for context only
     plot_task(task, show_test_output=False)
-    task_image_path = f"{task_id}.task.png"
+    task_image_path = f"{task_id}.{prompt_tag}.task.png"
     plt.savefig(task_image_path)
     plt.close()
     console.log(f"Saved task visualization → {task_image_path}")
 
     # First LLM call (vision + text) to get reasoning/description
     prompt1 = build_first_prompt(task_without_test_output, prompt_version)
-    first_text, first_raw = submit_to_openai_api(task_image_path, prompt1)
+    first_text, first_raw = submit_to_openai_api(task_image_path, prompt1, recalculate_cache=recalculate_cache)
     console.log(f"First call (vision+text) produced description_len={len(first_text)}")
     console.log("First call output_text:")
     console.log(first_text)
@@ -298,7 +327,7 @@ def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', ntries: int 
             if i < len(viz_task.get("test", [])):
                 viz_task["test"][i]["output"] = pred
     plot_task(viz_task, show_test_output=True)
-    predicted_image_path = f"{task_id}.output.png"
+    predicted_image_path = f"{task_id}.{prompt_tag}.output.png"
     plt.savefig(predicted_image_path)
     plt.close()
     console.log(f"Saved predicted visualization → {predicted_image_path}")
@@ -314,10 +343,13 @@ def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', ntries: int 
         "predictions": predictions,
         "ntries": ntries,
         "success": success,
+        "correct": success and predictions is not None,
     }
     out_json["task_file"] = task_file
     out_json["task_id"] = task_id
-    out_json_path = f"{task_id}.output.json"
+    out_json["prompt_version"] = prompt_version
+    out_json["prompt_tag"] = prompt_tag
+    out_json_path = f"{task_id}.{prompt_tag}.output.json"
     with open(out_json_path, "w") as f:
         json.dump(out_json, f, indent=2)
     console.log(f"Saved outputs → {out_json_path}")
