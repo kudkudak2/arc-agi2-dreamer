@@ -3,6 +3,7 @@ import base64
 import requests
 import os
 import hashlib
+import copy
 import traceback
 import time
 from typing import Any, Dict, List, Tuple
@@ -179,6 +180,23 @@ def build_first_prompt(task_without_test_output: Dict[str, Any], version: str) -
             f"Task (JSON without test outputs): {json.dumps(task_without_test_output)}"
         )
 
+    if version == "baseline":
+        return (
+            "You are given ARC training input/output pairs and test inputs. "
+            "For each test input, predict the corresponding output. "
+            "Be deterministic; infer a rule mapping input to output from the training examples.\n\n"
+            f"Task (JSON without test outputs): {json.dumps(task_without_test_output)}\n\n"
+            "Return your predictions as a JSON array where each element corresponds to the test input at the same index. "
+            "Each prediction should be a 2D array (list of lists) representing the output grid.\n\n"
+            "Example format:\n"
+            "If you have 2 test inputs, return:\n"
+            "[\n"
+            "  [[0, 1, 2], [3, 4, 5]],\n"
+            "  [[1, 0, 1], [0, 1, 0]]\n"
+            "]\n\n"
+            "Where the first array is the prediction for the first test input, and the second array is the prediction for the second test input."
+        )
+
     if version == 'real_world_v2':
         return (
 """
@@ -216,6 +234,30 @@ Note that A-C is just like in the real world where what happens next depends on 
         "Remember to think about it as abstract depiction of a real world situation."
     )
 
+def validate_predictions_against_test_outputs(predictions: List[List[List[int]]], task: Dict[str, Any]) -> Tuple[bool, str | None]:
+    """Validate predictions against expected test outputs."""
+    test_cases = task.get("test", [])
+    if len(predictions) != len(test_cases):
+        return False, f"Expected {len(test_cases)} predictions, got {len(predictions)}"
+    
+    for i, (prediction, test_case) in enumerate(zip(predictions, test_cases)):
+        expected_output = test_case.get("output")
+
+        if expected_output is None:
+            raise ValueError(f"Expected output is None for test case {i}")
+        
+
+        if prediction != expected_output:
+            return False, json.dumps({
+                "type": "test_mismatch",
+                "test_index": i,
+                "test_input": test_case["input"],
+                "expected_output": expected_output,
+                "predicted_output": prediction,
+            })
+    
+    return True, None
+
 def execute_and_validate_generated_code(code_str: str, task: Dict[str, Any]) -> Tuple[bool, str | None, List[List[List[int]]] | None]:
     namespace: Dict[str, Any] = {}
     try:
@@ -241,10 +283,19 @@ def execute_and_validate_generated_code(code_str: str, task: Dict[str, Any]) -> 
         for pair in task.get("test", []):
             predictions.append(predict_fn(pair["input"]))
         console.log("[green]Generated code passed all training pairs ✓[/green]")
+        
+        # Validate against expected test outputs
+        # test_valid, test_error = validate_predictions_against_test_outputs(predictions, task)
+        # if not test_valid:
+        #     console.log(f"[yellow]Generated code failed test validation: {test_error}[/yellow]")
+        #     return False, test_error, predictions
+        
+        console.log("[green]Generated code passed all test validations ✓[/green]")
         return True, None, predictions
     except Exception as e:
         tb = traceback.format_exc()
         console.log("[bold red]Runtime error while executing generated code[/bold red]")
+        console.log(tb)
         return False, "traceback\n" + tb, None
 
 def refine_code_prompt(previous_prompt: str, code_str: str, error_text: str, task: Dict[str, Any]) -> str:
@@ -267,19 +318,78 @@ def extract_text(response_json):
                 out.append(c.get("text", ""))
     return "\n".join(out).strip()
 
+def parse_baseline_predictions(response_text: str, task: Dict[str, Any]) -> Tuple[bool, str | None, List[List[List[int]]] | None]:
+    """Parse baseline predictions from LLM response and validate them."""
+    try:
+        # Try to extract JSON from the response
+        import re
+        json_match = re.search(r'\[[\s\S]*\]', response_text)
+        if not json_match:
+            return False, "No JSON array found in response", None
+        
+        predictions_json = json_match.group(0)
+        predictions = json.loads(predictions_json)
+        
+        # Validate predictions format
+        if not isinstance(predictions, list):
+            return False, "Predictions must be a JSON array", None
+        
+        test_inputs = [p["input"] for p in task.get("test", [])]
+        if len(predictions) != len(test_inputs):
+            return False, f"Expected {len(test_inputs)} predictions, got {len(predictions)}", None
+        
+        # Validate each prediction
+        for i, pred in enumerate(predictions):
+            if not isinstance(pred, list):
+                return False, f"Prediction {i} must be a list", None
+            for j, row in enumerate(pred):
+                if not isinstance(row, list):
+                    return False, f"Prediction {i}, row {j} must be a list", None
+                for k, cell in enumerate(row):
+                    if not isinstance(cell, int):
+                        return False, f"Prediction {i}, row {j}, cell {k} must be an integer", None
+        
+        # Check against training pairs
+        for pair in task["train"]:
+            # Find matching test input (if any)
+            for i, test_input in enumerate(test_inputs):
+                if test_input == pair["input"]:
+                    if predictions[i] != pair["output"]:
+                        return False, json.dumps({
+                            "type": "training_mismatch",
+                            "failing_input": pair["input"],
+                            "expected_output": pair["output"],
+                            "predicted_output": predictions[i],
+                        }), None
+                    break
+        
+        # Validate against expected test outputs
+        test_valid, test_error = validate_predictions_against_test_outputs(predictions, task, no_test=True)
+        if not test_valid:
+            return False, test_error, None
+        
+        return True, None, predictions
+        
+    except json.JSONDecodeError as e:
+        return False, f"Invalid JSON in predictions: {e}", None
+    except Exception as e:
+        return False, f"Error parsing predictions: {e}", None
+
 def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', recalculate_cache=False, ntries: int = 3, prompt_version: str = 'real_world'):
     # Load task from JSON file
-    task = load_task(task_file)
-    task_without_test_output = task.copy()
+    task_without_test_output = load_task(task_file)
     for ex in task_without_test_output['test']:
+        assert ex['output'] is not None, f"Expected output is None for test case {ex}"
         del ex['output']
     
     console.log(f"Starting ARC solve pipeline (task_file={task_file}, ntries={ntries}, prompt_version={prompt_version})")
     task_id = os.path.splitext(os.path.basename(task_file))[0]
     prompt_tag = 'real' if prompt_version in ('real_world', 'real') else 'trivial'
     prompt_tag = "real_v2" if prompt_version == "real_world_v2" else prompt_tag
+    prompt_tag = "baseline" if prompt_version == "baseline" else prompt_tag
+    
     # Visualize inputs (without test outputs) for context only
-    plot_task(task, show_test_output=False)
+    plot_task(task_without_test_output, show_test_output=False)
     task_image_path = f"{task_id}.{prompt_tag}.task.png"
     plt.savefig(task_image_path)
     plt.close()
@@ -292,36 +402,53 @@ def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', recalculate_
     console.log("First call output_text:")
     console.log(first_text)
 
-    # Second LLM call: code generation based on first_text and task
-    code_attempts: List[Dict[str, Any]] = []
-    code_prompt = build_codegen_prompt(first_text, task)
-    attempt = 0
-    success = False
-    predictions: List[List[List[int]]] | None = None
-    while attempt < max(1, int(ntries)) and not success:
-        attempt += 1
-        console.log(f"Codegen attempt {attempt}/{ntries}")
-        code_text, code_raw = submit_openai_text(code_prompt)
-        ok, err, preds = execute_and_validate_generated_code(code_text, task)
-        code_attempts.append({
-            "attempt": attempt,
-            "prompt": code_prompt,
-            "code": code_text,
-            "raw_response": code_raw,
-            "error": err,
-            "passed_train": ok,
-        })
-        if ok:
-            success = True
-            predictions = preds
-            console.log("[green]Codegen succeeded on training pairs ✓[/green]")
-            break
-        # refine
-        code_prompt = refine_code_prompt(code_prompt, code_text, err or "unknown error", task)
-        console.log(f"Refined prompt for next attempt (len={len(code_prompt)})")
+    # Handle baseline prompt version (no code generation)
+    if prompt_version == "baseline":
+        console.log("Using baseline mode - parsing predictions directly from LLM response")
+        success, error_msg, predictions = parse_baseline_predictions(first_text, task_without_test_output)
+        code_attempts = [{
+            "attempt": 1,
+            "prompt": prompt1,
+            "code": None,
+            "raw_response": first_raw,
+            "error": error_msg,
+            "passed_train": success,
+        }]
+        if success:
+            console.log("[green]Baseline predictions validated successfully ✓[/green]")
+        else:
+            console.log(f"[yellow]Baseline predictions failed validation: {error_msg}[/yellow]")
+    else:
+        # Second LLM call: code generation based on first_text and task
+        code_attempts: List[Dict[str, Any]] = []
+        code_prompt = build_codegen_prompt(first_text, task_without_test_output)
+        attempt = 0
+        success = False
+        predictions: List[List[List[int]]] | None = None
+        while attempt < max(1, int(ntries)) and not success:
+            attempt += 1
+            console.log(f"Codegen attempt {attempt}/{ntries}")
+            code_text, code_raw = submit_openai_text(code_prompt)
+            ok, err, preds = execute_and_validate_generated_code(code_text, task_without_test_output)
+            code_attempts.append({
+                "attempt": attempt,
+                "prompt": code_prompt,
+                "code": code_text,
+                "raw_response": code_raw,
+                "error": err,
+                "passed_train": ok,
+            })
+            if ok:
+                success = True
+                predictions = preds
+                console.log("[green]Codegen succeeded on training pairs ✓[/green]")
+                break
+            # refine
+            code_prompt = refine_code_prompt(code_prompt, code_text, err or "unknown error", task_without_test_output)
+            console.log(f"Refined prompt for next attempt (len={len(code_prompt)})")
 
     # Prepare visualization with predictions (if any)
-    viz_task = json.loads(json.dumps(task))
+    viz_task = json.loads(json.dumps(task_without_test_output))
     if predictions is not None:
         for i, pred in enumerate(predictions):
             if i < len(viz_task.get("test", [])):
@@ -332,6 +459,13 @@ def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', recalculate_
     plt.close()
     console.log(f"Saved predicted visualization → {predicted_image_path}")
 
+    # Determine if predictions are correct by validating against test outputs
+    task = load_task(task_file) # Load for the first time with outputs
+    correct = False
+    if predictions is not None:
+        test_valid, _ = validate_predictions_against_test_outputs(predictions, task)
+        correct = test_valid
+    
     # Save detailed JSON
     out_json = {
         "first_call": {
@@ -343,7 +477,7 @@ def main(task_file: str = '../ARC-AGI/data/training/d631b094.json', recalculate_
         "predictions": predictions,
         "ntries": ntries,
         "success": success,
-        "correct": success and predictions is not None,
+        "correct": correct,
     }
     out_json["task_file"] = task_file
     out_json["task_id"] = task_id
